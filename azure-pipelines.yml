@@ -1,0 +1,165 @@
+trigger:
+  batch: true
+  branches:
+    include:
+      - master
+  paths:
+    exclude:
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - '*'
+  paths:
+    exclude:
+      - azure-pipelines.yml
+
+variables: 
+  - name: TF_LOG
+    value: TRACE
+  - name: TF_LOG_PATH
+    value: '$(System.DefaultWorkingDirectory)\Debug.log'
+
+stages:
+- stage: Deploy_PROD
+  jobs:
+  - job: build
+    pool: 'mh-vmss-hub-cus-1'
+    steps:
+    - checkout: self
+    - task: PowerShell@2
+      displayName: Configure git
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          $base64Pat=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(":${env:SYSTEM_ACCESSTOKEN}"))
+          $REPO_URL="https://dev.azure.com/MindpathHealth/CloudEngineering/_git/mh-az-lz-tf-iac-level1-policy"
+          git config --global http.$REPO_URL.extraHeader "AUTHORIZATION: Basic $base64Pat"
+        failOnStderr: true
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.6.6'
+    - task: TerraformTask@5
+      displayName: Init
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        backendServiceArm: 'mh-azure-terraform-prod'
+        backendAzureRmStorageAccountName: 'strmhstatemgmtprd'
+        backendAzureRmContainerName: 'level1'
+        backendAzureRmKey: 'azurepolicy.terraform.tfstate'
+        backendAzureRmUseIdTokenGeneration: true
+        environmentAzureRmUseIdTokenGeneration: true
+
+    - task: TerraformTask@5
+      displayName: Validate
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+        environmentServiceNameAzureRM: 'mh-azure-terraform-prod'
+        backendAzureRmUseIdTokenGeneration: true
+        environmentAzureRmUseIdTokenGeneration: true
+    
+    - task: TerraformTask@5
+      displayName: Plan
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+        commandOptions: '-out=$(System.DefaultWorkingDirectory)\plan -parallelism=25'
+        environmentServiceNameAzureRM: 'mh-azure-terraform-prod'
+        backendAzureRmUseIdTokenGeneration: true
+        environmentAzureRmUseIdTokenGeneration: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Plan File
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)\plan'
+        ArtifactName: 'PLAN'
+        publishLocation: 'Container'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish INIT Debug
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)\Debug.log'
+        ArtifactName: 'INIT'
+        publishLocation: 'Container'
+
+  - job: waitForValidation
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    dependsOn:
+      - build
+    displayName: Wait for Plan validation  
+    pool: server    
+    steps:   
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: 'donovan.reid@mindpath.com'
+        instructions: 'ONLY APPROVE, if TF plan is acceptable'
+
+  - job: Deploy
+    dependsOn: 
+      - build
+      - waitForValidation
+    timeoutInMinutes: 90
+    displayName: Deploy
+    pool: mh-vmss-hub-cus-1
+    steps:
+    - checkout: self
+    - script: echo UAT
+    - task: PowerShell@2
+      displayName: Configure git
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      inputs:
+        targetType: 'inline'
+        script: |
+          $base64Pat=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(":${env:SYSTEM_ACCESSTOKEN}"))
+          $REPO_URL="https://dev.azure.com/MindpathHealth/CloudEngineering/_git/mh-az-lz-tf-iac-level1-policy"
+          git config --global http.$REPO_URL.extraHeader "AUTHORIZATION: Basic $base64Pat"
+        failOnStderr: true
+
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        buildType: 'current'
+        artifactName: 'PLAN'
+        itemPattern: '**'
+        targetPath: '$(System.DefaultWorkingDirectory)'
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.6.6'
+    - task: TerraformTask@5
+      displayName: Init
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        backendServiceArm: 'mh-azure-terraform-prod'
+        backendAzureRmStorageAccountName: 'strmhstatemgmtprd'
+        backendAzureRmContainerName: 'level1'
+        backendAzureRmKey: 'azurepolicy.terraform.tfstate'
+        backendAzureRmUseIdTokenGeneration: true
+        environmentAzureRmUseIdTokenGeneration: true
+
+    - task: TerraformTask@5
+      displayName: Apply
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+        commandOptions: '-parallelism=25 "$(System.DefaultWorkingDirectory)\plan"'
+        environmentServiceNameAzureRM: 'mh-azure-terraform-prod'
+        backendAzureRmUseIdTokenGeneration: true
+        environmentAzureRmUseIdTokenGeneration: true
+    - task: PublishBuildArtifacts@1
+      displayName: Publish DEBUG Deploy
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)\Debug.log'
+        ArtifactName: 'DEPLOY'
+        publishLocation: 'Container'
+      condition: succeededOrFailed()
